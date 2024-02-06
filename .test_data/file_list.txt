@@ -1,0 +1,2 @@
+.test_data/GCF_000056065.1.json
+.test_data/GCA_000056065.1.json
