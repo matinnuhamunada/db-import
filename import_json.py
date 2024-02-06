@@ -68,7 +68,9 @@ logging.info(f"Using antiSMASH options: {options}")
 logging.info("RiPP products: %s", RIPP_PRODUCTS)
 
 
-def main(filename, db_connection, allowed_assembly_prefix="GCF,GCA"):
+def main(
+    filename, db_connection, allowed_assembly_prefix="GCF,GCA", ignore_check=False
+):
     """Run the import."""
     logging.info("RUNNING: def main...")
     connection = psycopg2.connect(db_connection)
@@ -226,7 +228,7 @@ def get_or_create_genome(rec, cur, assembly_id):
     return ret[0]
 
 
-def get_taxid(rec):
+def get_taxid(rec, default_taxid=2495523):
     """Extract the taxid from a record."""
     logging.info("RUNNING: def get_taxid...")
     for feature in rec.get_misc_feature_by_type("source"):
@@ -234,7 +236,7 @@ def get_taxid(rec):
             continue
         refs = feature.get_qualifier("db_xref")
         if refs is None:
-            return 0
+            return default_taxid
         for entry in refs:
             if entry.startswith("taxon:"):
                 return int(entry[6:])
@@ -1271,6 +1273,7 @@ def get_or_create_tax_id(cur, name, ncbi_taxid, strain):
     )
     ret = cur.fetchone()
     if ret is None:
+        logging.debug(f"Getting lineage for taxid: {ncbi_taxid}")
         lineage = get_lineage(ncbi_taxid)
         lineage["ncbi_taxid"] = ncbi_taxid
         lineage["name"] = combined_name
@@ -1428,6 +1431,12 @@ if __name__ == "__main__":
         default="GCF,GCA",
         help="Allowed assembly prefixes (default: %(default)s)",
     )
+    parser.add_argument(
+        "--ignore_check",
+        action="store_true",
+        default=False,
+        help="Ignore check (default: %(default)s)",
+    )
     parser.add_argument("filenames", nargs="*")
     args = parser.parse_args()
 
@@ -1454,7 +1463,10 @@ if __name__ == "__main__":
         start_time = time.time()
         try:
             main(
-                filename, args.db, allowed_assembly_prefix=args.allowed_assembly_prefix
+                filename,
+                args.db,
+                allowed_assembly_prefix=args.allowed_assembly_prefix,
+                ignore_check=args.ignore_check,
             )
             successful_imports += 1
             if args.success_log:
