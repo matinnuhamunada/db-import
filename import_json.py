@@ -36,6 +36,7 @@ Entrez.email = "matinnu@biosustain.dtu.dk"
 REPORTED_TYPES = set()
 
 options = antismash.config.build_config([])
+
 RIPP_PRODUCTS = set(
     map(
         lambda r: r.name,
@@ -67,7 +68,7 @@ logging.info(f"Using antiSMASH options: {options}")
 logging.info("RiPP products: %s", RIPP_PRODUCTS)
 
 
-def main(filename, db_connection):
+def main(filename, db_connection, allowed_assembly_prefix="GCF,GCA"):
     """Run the import."""
     logging.info("RUNNING: def main...")
     connection = psycopg2.connect(db_connection)
@@ -83,10 +84,19 @@ def main(filename, db_connection):
                 logging.error("cannot determine assembly_id, using basename...")
                 short_name, _ = os.path.splitext(os.path.basename(filename))
                 id_parts = short_name.split("_")
-                if id_parts[0] not in ("GCF", "GCA"):
+                allowed_assembly_prefix = [
+                    prefix.strip() for prefix in allowed_assembly_prefix.split(",")
+                ]
+                logging.debug(f"Allowed assembly prefixes: {allowed_assembly_prefix}")
+                if not any(
+                    [
+                        id_parts[0].startswith(prefix)
+                        for prefix in allowed_assembly_prefix
+                    ]
+                ):
                     logging.error("no assembly_id found in filename")
                     raise MissingAssemblyIdError(
-                        "assembly ID does not begin with 'GCF'/'GCA'"
+                        f"assembly ID {id_parts[0]} does not begin with {allowed_assembly_prefix}"
                     )
                 assembly_id = "_".join(id_parts[:2])
 
@@ -1413,6 +1423,11 @@ if __name__ == "__main__":
         default=None,
         help="File to store file names that failed to import in",
     )
+    parser.add_argument(
+        "--allowed_assembly_prefix",
+        default="GCF,GCA",
+        help="Allowed assembly prefixes (default: %(default)s)",
+    )
     parser.add_argument("filenames", nargs="*")
     args = parser.parse_args()
 
@@ -1438,7 +1453,9 @@ if __name__ == "__main__":
     for filename in filenames:
         start_time = time.time()
         try:
-            main(filename, args.db)
+            main(
+                filename, args.db, allowed_assembly_prefix=args.allowed_assembly_prefix
+            )
             successful_imports += 1
             if args.success_log:
                 print(filename, file=args.success_log)
