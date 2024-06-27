@@ -191,7 +191,7 @@ def get_or_create_genome(rec, cur, assembly_id):
     return ret[0]
 
 
-def get_taxid(rec):
+def get_taxid(rec, default_taxid=32644):
     """Extract the taxid from a record."""
     logging.debug("RUNNING: def get_taxid...")
     for feature in rec.get_misc_feature_by_type("source"):
@@ -199,7 +199,7 @@ def get_taxid(rec):
             continue
         refs = feature.get_qualifier("db_xref")
         if refs is None:
-            return 0
+            return default_taxid
         for entry in refs:
             if entry.startswith("taxon:"):
                 return int(entry[6:])
@@ -1159,7 +1159,7 @@ VALUES (?, ?)"""
 
 def get_or_create_tax_id(cur, name, ncbi_taxid, strain):
     """Get the tax_id or create a new one."""
-    logging.debug("RUNNING: def get_or_create_tax_id...")
+    logging.debug(f"RUNNING: def get_or_create_tax_id: {ncbi_taxid} - {strain}...")
     combined_name = f"{name} {strain}"
     cur.execute(
         "SELECT tax_id FROM antismash.taxa WHERE name = ? AND ncbi_taxid = ?",
@@ -1188,7 +1188,7 @@ def get_or_create_tax_id(cur, name, ncbi_taxid, strain):
             cur.execute(
                 """
 INSERT INTO antismash.taxa (ncbi_taxid, superkingdom, kingdom, phylum, class, taxonomic_order, family, genus, species, strain, name) VALUES
-    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING tax_id""",
+    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING tax_id""",
                 parameters,
             )
         except KeyError:
@@ -1216,6 +1216,7 @@ def get_lineage(taxid):
     retries = 5
     while retries > 0:
         try:
+            logging.debug(f"Fetching taxonomy for taxid {taxid}...")
             handle = Entrez.efetch(
                 db="taxonomy", id=taxid, retmode="xml", **extra_params
             )
