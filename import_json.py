@@ -29,7 +29,7 @@ log_format = "%(levelname)-8s %(asctime)s   %(message)s"
 date_format = "%d/%m %H:%M:%S"
 logging.basicConfig(format=log_format, datefmt=date_format, level=logging.DEBUG)
 
-DB_CONNECTION = "antismash_db_test.duckdb"
+DB_CONNECTION = "antismash_db.duckdb"
 Entrez.email = "matinnu@biosustain.dtu.dk"
 REPORTED_TYPES = set()
 
