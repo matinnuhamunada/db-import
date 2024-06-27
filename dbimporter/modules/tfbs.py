@@ -14,7 +14,9 @@ _REGULATOR_IDS = {}
 def get_regulator_id(cursor, name):
     """Get the TFBS regulator_id given the name of the regulator."""
     if name not in _REGULATOR_IDS:
-        cursor.execute("SELECT regulator_id FROM antismash.regulators WHERE name = %s", (name,))
+        cursor.execute(
+            "SELECT regulator_id FROM antismash.regulators WHERE name = ?", (name,)
+        )
         ret = cursor.fetchone()
         if ret is None:
             raise ValueError("could not find matching regulator entry for: %s" % name)
@@ -25,10 +27,15 @@ def get_regulator_id(cursor, name):
 def get_confidence_id(cursor, name):
     """Get the TFBS confidence level id given the confidence name."""
     if name not in _CONFIDENCE_IDS:
-        cursor.execute("SELECT confidence_id FROM antismash.regulator_confidence WHERE name = %s", (name,))
+        cursor.execute(
+            "SELECT confidence_id FROM antismash.regulator_confidence WHERE name = ?",
+            (name,),
+        )
         ret = cursor.fetchone()
         if ret is None:
-            raise ValueError("could not find matching regulator confidence entry for: %s" % name)
+            raise ValueError(
+                "could not find matching regulator confidence entry for: %s" % name
+            )
         _CONFIDENCE_IDS[name] = ret[0]
     return _CONFIDENCE_IDS[name]
 
@@ -47,8 +54,20 @@ def import_results(data: RecordData) -> None:
                 "region_id": region_id,
                 "score": hit.score,
                 "start": hit.start,
-                "confidence_id": get_confidence_id(data.cursor, str(hit.confidence).lower()),
+                "confidence_id": get_confidence_id(
+                    data.cursor, str(hit.confidence).lower()
+                ),
             }
-            data.insert("""
+            parameters = (
+                params["regulator_id"],
+                params["region_id"],
+                params["score"],
+                params["start"],
+                params["confidence_id"],
+            )
+            data.insert(
+                """
 INSERT INTO antismash.binding_sites (regulator_id, region_id, score, start, confidence_id)
-VALUES (%(regulator_id)s, %(region_id)s, %(score)s, %(start)s, %(confidence_id)s)""", params)
+VALUES (?, ?, ?, ?, ?)""",
+                parameters,
+            )

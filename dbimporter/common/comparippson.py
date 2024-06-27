@@ -5,7 +5,6 @@
 
 import antismash
 from antismash.common import comparippson
-from antismash.custom_typing import AntismashModule
 
 from .record_data import RecordData
 
@@ -25,16 +24,28 @@ def get_mibig_id(data, hit: comparippson.data_structures.Hit) -> int:
     """Get the TFBS regulator_id given the name of the regulator."""
     key = (hit.reference_fields["accession"], hit.reference_fields["locus"])
     if key not in _MIBIG_IDS:
-        data.cursor.execute("""
+        data.cursor.execute(
+            """
 SELECT comparippson_mibig_id
 FROM antismash.comparippson_mibig_references
-WHERE accession = %s AND name = %s""", key)
+WHERE accession = ? AND name = ?""",
+            key,
+        )
         ret = data.cursor.fetchone()
         if ret is None:
-            reference_id = data.insert("""
+            parameters = {
+                hit.reference_fields["accession"],
+                hit.reference_fields["locus"],
+                hit.reference_fields["type"],
+                hit.reference_fields["compounds"],
+            }
+            reference_id = data.insert(
+                """
 INSERT INTO antismash.comparippson_mibig_references (accession, name, product, compound)
-VALUES (%(accession)s, %(locus)s, %(type)s, %(compounds)s)
-RETURNING comparippson_mibig_id""", hit.reference_fields)
+VALUES (?, ?, ?, ?)
+RETURNING comparippson_mibig_id""",
+                parameters,
+            )
         else:
             reference_id = ret[0]
         _MIBIG_IDS[key] = reference_id
@@ -44,19 +55,30 @@ RETURNING comparippson_mibig_id""", hit.reference_fields)
 def get_asdb_id(data, hit: comparippson.data_structures.Hit) -> int:
     """Get the TFBS regulator_id given the name of the regulator."""
     reference_name = hit.reference_fields["locus"]
-    data.cursor.execute("SELECT cds_id FROM antismash.cdss WHERE locus_tag = %s", (reference_name,))
+    data.cursor.execute(
+        "SELECT cds_id FROM antismash.cdss WHERE locus_tag = ?", (reference_name,)
+    )
     ret = data.cursor.fetchone()
     if ret is None:
-        raise ValueError(f"missing reference CDS from CompaRiPPson hit: {reference_name}")
+        raise ValueError(
+            f"missing reference CDS from CompaRiPPson hit: {reference_name}"
+        )
     cds_id = ret[0]
 
-    data.cursor.execute("SELECT comparippson_asdb_id FROM antismash.comparippson_asdb_references WHERE cds_id = %s", (cds_id,))
+    data.cursor.execute(
+        "SELECT comparippson_asdb_id FROM antismash.comparippson_asdb_references WHERE cds_id = ?",
+        (cds_id,),
+    )
     ret = data.cursor.fetchone()
     if ret is None:
-        reference_id = data.insert("""
+        parameters = {hit.reference_fields["locus"], hit.reference_fields["type"]}
+        reference_id = data.insert(
+            """
 INSERT INTO antismash.comparippson_asdb_references (name, product)
-VALUES (%(locus)s, %(type)s)
-RETURNING comparippson_asdb_id""", hit.reference_fields)
+VALUES (?, ?)
+RETURNING comparippson_asdb_id""",
+            parameters,
+        )
     else:
         reference_id = ret[0]
     return reference_id
@@ -65,9 +87,14 @@ RETURNING comparippson_asdb_id""", hit.reference_fields)
 def import_db(data: RecordData, results: comparippson.analysis.DBResults) -> None:
     for name, hits in results.hits.items():
         for hit in hits:
-            if hit.similarity < min(MIBIG_SIMILARITY_THRESHOLD, ASDB_SIMILARITY_THRESHOLD):
+            if hit.similarity < min(
+                MIBIG_SIMILARITY_THRESHOLD, ASDB_SIMILARITY_THRESHOLD
+            ):
                 continue
-            data.cursor.execute("SELECT cds_id, region_id FROM antismash.cdss WHERE locus_tag = %s", (name,))
+            data.cursor.execute(
+                "SELECT cds_id, region_id FROM antismash.cdss WHERE locus_tag = ?",
+                (name,),
+            )
             cds_id, region_id = data.cursor.fetchone()
             params = {
                 "cds_id": cds_id,
@@ -85,10 +112,19 @@ def import_db(data: RecordData, results: comparippson.analysis.DBResults) -> Non
                 if hit.similarity < ASDB_SIMILARITY_THRESHOLD:
                     continue
                 params["asdb_id"] = get_asdb_id(data, hit)
-
-            data.insert("""
+            parameters = (
+                params["cds_id"],
+                params["similarity"],
+                params["region_id"],
+                params["mibig_id"],
+                params["asdb_id"],
+            )
+            data.insert(
+                """
 INSERT INTO antismash.comparippson_hits (cds_id, similarity, region_id, comparippson_mibig_id, comparippson_asdb_id)
-VALUES (%(cds_id)s, %(similarity)s, %(region_id)s, %(mibig_id)s, %(asdb_id)s)""", params)
+VALUES (?, ?, ?, ?, ?)""",
+                parameters,
+            )
 
 
 def import_results(data: RecordData) -> None:

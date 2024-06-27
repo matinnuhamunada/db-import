@@ -1,12 +1,20 @@
 # License: GNU Affero General Public License v3 or later
 # A copy of GNU AGPL v3 should have been included in this software package in LICENSE.txt.
 
-from antismash.common.secmet import Feature, Record, Region
 from antismash.common.module_results import ModuleResults
+from antismash.common.secmet import Feature, Record, Region
+
 
 class RecordData:
-    def __init__(self, cursor, record: Record, record_id: int, assembly_id: int,
-                 module_results: dict[str, ModuleResults], record_no: int):
+    def __init__(
+        self,
+        cursor,
+        record: Record,
+        record_id: int,
+        assembly_id: int,
+        module_results: dict[str, ModuleResults],
+        record_no: int,
+    ):
         self.cursor = cursor
         self.record = record
         self.record_id = record_id
@@ -29,8 +37,10 @@ class RecordData:
         assert isinstance(region, Region)
         self._current_region = region
         if region not in self.feature_mapping:
-            self.cursor.execute("SELECT region_id FROM antismash.regions WHERE accession = %s and region_number = %s",
-                                (self.record_id, region.get_region_number()))
+            self.cursor.execute(
+                "SELECT region_id FROM antismash.regions WHERE accession = '?' and region_number = ?",
+                (self.record_id, region.get_region_number()),
+            )
             ret = self.cursor.fetchone()
             assert ret
             self.feature_mapping[region] = ret[0]

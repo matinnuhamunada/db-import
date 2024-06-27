@@ -1,47 +1,48 @@
 #!/usr/bin/env python3
 """Import an antiSMASH JSON results file into the antiSMASH database."""
-from argparse import ArgumentParser, FileType
-from collections import defaultdict
 import hashlib
 import json
+import logging
 import os
 import sys
 import time
 import traceback
 import urllib
-
-# pylint: disable=line-too-long,missing-docstring
+from argparse import ArgumentParser, FileType
+from collections import defaultdict
 
 import antismash
+import duckdb
 from antismash.modules.nrps_pks.data_structures import Prediction
 from antismash.modules.nrps_pks.name_mappings import get_substrate_by_name
 from Bio import Entrez
-import psycopg2
-import psycopg2.extensions
 
+from dbimporter.common import preparation
 from dbimporter.common.data import read_json
 from dbimporter.common.record_data import RecordData
-from dbimporter.common import (
-    getters,
-    preparation,
-)
-from dbimporter.modules import (
-    cluster_compare,
-    clusterblast,
-    tfbs,
-    pfams,
-    tigrfams,
-)
+from dbimporter.modules import cluster_compare, clusterblast, pfams, tfbs, tigrfams
 
-psycopg2.extensions.register_type(psycopg2.extensions.UNICODE)
-psycopg2.extensions.register_type(psycopg2.extensions.UNICODEARRAY)
+# pylint: disable=line-too-long,missing-docstring
 
-DB_CONNECTION = "host='localhost' port=5432 user='postgres' password='secret' dbname='antismash'"
-Entrez.email = "kblin@biosustain.dtu.dk"
+
+log_format = "%(levelname)-8s %(asctime)s   %(message)s"
+date_format = "%d/%m %H:%M:%S"
+logging.basicConfig(format=log_format, datefmt=date_format, level=logging.DEBUG)
+
+DB_CONNECTION = "antismash_db_test.duckdb"
+Entrez.email = "matinnu@biosustain.dtu.dk"
 REPORTED_TYPES = set()
 
 options = antismash.config.build_config([])
-RIPP_PRODUCTS = set(map(lambda r: r.name, filter(lambda r: r.category == "RiPP", antismash.detection.hmm_detection.get_ruleset(options).rules)))
+RIPP_PRODUCTS = set(
+    map(
+        lambda r: r.name,
+        filter(
+            lambda r: r.category == "RiPP",
+            antismash.detection.hmm_detection.get_ruleset(options).rules,
+        ),
+    )
+)
 assert RIPP_PRODUCTS
 
 CANDIDATE_KINDS: dict[str, int] = {}
@@ -55,10 +56,12 @@ class MissingAssemblyIdError(ValueError):
     pass
 
 
-def main(filename, db_connection):
+def main(
+    filename, db_connection, allowed_assembly_prefix="GCA,GCF", ignore_check=False
+):
     """Run the import."""
-    connection = psycopg2.connect(db_connection)
-    connection.autocommit = False
+    logging.info(f"Connecting to {db_connection}...")
+    connection = duckdb.connect(db_connection)
 
     raw_data, results = read_json(filename)
 
@@ -66,17 +69,26 @@ def main(filename, db_connection):
         try:
             short_name, _ = os.path.splitext(os.path.basename(filename))
             id_parts = short_name.split("_")
-            if id_parts[0] not in ("GCF", "GCA"):
+            allowed_assembly_prefix = [
+                prefix.strip() for prefix in allowed_assembly_prefix.split(",")
+            ]
+            if id_parts[0] not in allowed_assembly_prefix:
                 raise MissingAssemblyIdError("assembly ID does begin with 'GCF'/'GCA'")
             assembly_id = "_".join(id_parts[:2])
 
-            print("assembly_id:", assembly_id, end="\t")
+            logging.debug(f"Processing assembly_id: {assembly_id}")
             if assembly_id:
                 input_basename = os.path.basename(filename)
-                cursor.execute("SELECT (assembly_id) FROM antismash.filenames WHERE base_filename = %s AND assembly_id = %s", (input_basename, assembly_id))
+                cursor.execute(
+                    "SELECT (assembly_id) FROM antismash.filenames WHERE base_filename = ? AND assembly_id = ?",
+                    (input_basename, assembly_id),
+                )
                 if cursor.fetchone() is not None:
                     raise ExistingRecordError()
-                cursor.execute("INSERT INTO antismash.filenames (assembly_id, base_filename) VALUES (%s, %s)", (assembly_id, input_basename))
+                cursor.execute(
+                    "INSERT INTO antismash.filenames (assembly_id, base_filename) VALUES (?, ?)",
+                    (assembly_id, input_basename),
+                )
             record_no = 0
             for rec, module_results in zip(results.records, results.results):
                 raw_record = raw_data["records"][record_no]
@@ -84,7 +96,7 @@ def main(filename, db_connection):
                 preparation.prepare_record(rec, raw_record["areas"], module_results)
                 load_record(rec, module_results, cursor, assembly_id, record_no)
             connection.commit()
-            print(assembly_id, "changes committed", end="\t")
+            logging.info(f"Changes committed for: {assembly_id}")
         except ExistingRecordError:
             connection.rollback()
         except Exception:
@@ -95,11 +107,14 @@ def main(filename, db_connection):
 
 def load_record(rec, module_results, cur, assembly_id, record_no):
     """Load a record into the database using the cursor."""
+    logging.debug(f"RUNNING: def load_record {record_no}...")
     if not rec.get_regions():
         return
     genome_id = get_or_create_genome(rec, cur, assembly_id)
+    logging.info("genome_id: %s", genome_id)
     try:
         seq_id = get_or_create_dna_sequence(rec, cur, genome_id, record_no)
+        logging.info("seq_id: %s", seq_id)
     except ExistingRecordError:
         print("skipping existing record:", rec.id)
         raise
@@ -121,33 +136,56 @@ def load_record(rec, module_results, cur, assembly_id, record_no):
 
 def get_or_create_dna_sequence(rec, cur, genome_id, record_no):
     """Fetch existing dna_sequence entry or create a new one."""
+    logging.debug("RUNNING: def get_or_create_dna_sequence...")
     # record level entry
     params = {}
-    params['seq'] = str(rec.seq)
-    params['md5sum'] = hashlib.md5(params['seq'].encode('utf-8')).hexdigest()
-    params['accession'] = rec.annotations['accessions'][0]
-    params['version'] = rec.annotations.get('sequence_version', '0')
-    params['definition'] = rec.description
-    params['genome_id'] = genome_id
-    params['record_number'] = record_no
+    params["seq"] = str(rec.seq)
+    params["md5sum"] = hashlib.md5(params["seq"].encode("utf-8")).hexdigest()
+    params["accession"] = rec.annotations["accessions"][0]
+    params["version"] = rec.annotations.get("sequence_version", "0")
+    params["definition"] = rec.description
+    params["genome_id"] = genome_id
+    params["record_number"] = record_no
 
-    cur.execute("INSERT INTO antismash.dna_sequences (dna, md5, accession, version, definition, genome_id, record_number)"
-                "VALUES (%(seq)s, %(md5sum)s, %(accession)s, %(version)s, %(definition)s, %(genome_id)s, %(record_number)s)"
-                "RETURNING accession;", params)
+    parameters = (
+        params["seq"],
+        params["md5sum"],
+        params["accession"],
+        params["version"],
+        params["definition"],
+        params["genome_id"],
+        params["record_number"],
+    )
+
+    cur.execute(
+        "INSERT INTO antismash.dna_sequences (dna, md5, accession, version, definition, genome_id, record_number)"
+        "VALUES (?, ?, ?, ?, ?, ?, ?)"
+        "RETURNING accession;",
+        parameters,
+    )
     return cur.fetchone()[0]
 
 
 def get_or_create_genome(rec, cur, assembly_id):
     """Fetch existing genome entry or create a new one."""
-    try:
-        taxid = get_or_create_tax_id(cur, get_organism(rec), get_taxid(rec), get_strain(rec))
-    except psycopg2.ProgrammingError:
-        print(rec)
-        raise
-    cur.execute("SELECT genome_id FROM antismash.genomes WHERE tax_id = %s AND assembly_id = %s", (taxid, assembly_id))
+    logging.debug("RUNNING: def get_or_create_genome...")
+    # try:
+    taxid = get_or_create_tax_id(
+        cur, get_organism(rec), get_taxid(rec), get_strain(rec)
+    )
+    # except psycopg2.ProgrammingError:
+    #    print(rec)
+    #    raise
+    cur.execute(
+        "SELECT genome_id FROM antismash.genomes WHERE tax_id = ? AND assembly_id = ?",
+        (taxid[0], assembly_id),
+    )
     ret = cur.fetchone()
     if ret is None:
-        cur.execute("INSERT INTO antismash.genomes (tax_id, assembly_id) VALUES (%s, %s) RETURNING genome_id, tax_id, assembly_id;", (taxid, assembly_id))
+        cur.execute(
+            "INSERT INTO antismash.genomes (tax_id, assembly_id) VALUES (?, ?) RETURNING genome_id, tax_id, assembly_id;",
+            (taxid[0], assembly_id),
+        )
         ret = cur.fetchone()
 
     return ret[0]
@@ -155,14 +193,15 @@ def get_or_create_genome(rec, cur, assembly_id):
 
 def get_taxid(rec):
     """Extract the taxid from a record."""
+    logging.debug("RUNNING: def get_taxid...")
     for feature in rec.get_misc_feature_by_type("source"):
-        if feature.type != 'source':
+        if feature.type != "source":
             continue
         refs = feature.get_qualifier("db_xref")
         if refs is None:
             return 0
         for entry in refs:
-            if entry.startswith('taxon:'):
+            if entry.startswith("taxon:"):
                 return int(entry[6:])
     return None
 
@@ -201,29 +240,48 @@ def handle_gene(data, gene):
         return
 
     params = {
-        'location': str(gene.location),
-        'locus_tag': gene.locus_tag,
-        'region_id': region_id,
+        "location": str(gene.location),
+        "locus_tag": gene.locus_tag,
+        "region_id": region_id,
     }
-
-    data.insert("""
+    parameters = (
+        params["locus_tag"],
+        params["location"],
+        params["region_id"],
+    )
+    data.insert(
+        """
 INSERT INTO antismash.genes (locus_tag, location, region_id)
-VALUES (%(locus_tag)s, %(location)s, %(region_id)s)""", params)
+VALUES (?, ?, ?)""",
+        parameters,
+    )
 
 
 def handle_cds(data, region_id, cds):
     """Handle CDS features."""
     params = {}
-    params['location'] = str(cds.location)
+    params["location"] = str(cds.location)
 
-    params['locus_tag'] = cds.locus_tag
-    params['name'] = cds.gene
-    params['product'] = cds.product
-    params['protein_id'] = cds.protein_id
-    params['func_class'] = str(cds.gene_function)
-    params['translation'] = cds.translation
-    params['region_id'] = region_id
-    cds_id = data.insert("""
+    params["locus_tag"] = cds.locus_tag
+    params["name"] = cds.gene
+    params["product"] = cds.product
+    params["protein_id"] = cds.protein_id
+    params["func_class"] = str(cds.gene_function)
+    params["translation"] = cds.translation
+    params["region_id"] = region_id
+
+    parameters = (
+        params["func_class"],
+        params["locus_tag"],
+        params["name"],
+        params["product"],
+        params["protein_id"],
+        params["location"],
+        params["translation"],
+        params["region_id"],
+    )
+    cds_id = data.insert(
+        """
 INSERT INTO antismash.cdss (
     functional_class_id,
     locus_tag,
@@ -233,15 +291,20 @@ INSERT INTO antismash.cdss (
     location,
     translation,
     region_id
-) VALUES
-( (SELECT functional_class_id FROM antismash.functional_classes WHERE name = %(func_class)s),
-  %(locus_tag)s, %(name)s, %(product)s, %(protein_id)s, %(location)s, %(translation)s, %(region_id)s)
+) VALUES (
+    (SELECT functional_class_id FROM antismash.functional_classes WHERE name = ?),
+    ?, ?, ?, ?, ?, ?, ?
+)
 RETURNING cds_id
-""", params)
+""",
+        parameters,
+    )
     assert cds_id
     data.feature_mapping[cds] = cds_id
 
-    genefunctions = data.module_results[antismash.detection.genefunctions.__name__]._tools
+    genefunctions = data.module_results[
+        antismash.detection.genefunctions.__name__
+    ]._tools
 
     all_smcog_results = genefunctions.get("smcogs")
     hit = all_smcog_results.best_hits.get(cds.get_name())
@@ -262,16 +325,24 @@ def add_tta_codons(data):
     if not tta_results:
         return
     for feature in tta_results.features:
-        data.insert("INSERT INTO antismash.tta_codons (location, seq_id) VALUES (%s, %s)", (str(feature.location), data.record_id))
+        data.insert(
+            "INSERT INTO antismash.tta_codons (location, seq_id) VALUES (?, ?)",
+            (str(feature.location), data.record_id),
+        )
 
 
 def create_resfam_hit(cursor, hit, cds_id):
-    cursor.execute("SELECT resfam_id from antismash.resfams WHERE name = %s", (hit.hit_id,))
+    cursor.execute(
+        "SELECT resfam_id from antismash.resfams WHERE name = ?", (hit.hit_id,)
+    )
     ret = cursor.fetchone()
     if not ret:
-        raise ValueError("unknown resfam ID: %s" % hit.hit_id)
+        raise ValueError("unknown resfam ID: %s?" % hit.hit_id)
     resfam_id = ret[0]
-    cursor.execute("INSERT INTO antismash.resfam_domains (score, evalue, resfam_id, cds_id) VALUES (%s, %s, %s, %s)", (hit.bitscore, hit.evalue, resfam_id, cds_id))
+    cursor.execute(
+        "INSERT INTO antismash.resfam_domains (score, evalue, resfam_id, cds_id) VALUES (?, ?, ?, ?)",
+        (hit.bitscore, hit.evalue, resfam_id, cds_id),
+    )
 
 
 def create_smcog_hit(cur, hit, cds_id):
@@ -280,23 +351,36 @@ def create_smcog_hit(cur, hit, cds_id):
     smcog_score = hit.bitscore
     smcog_evalue = hit.evalue
     smcog_id = get_smcog_id(cur, smcog_name)
-    cur.execute("INSERT INTO antismash.smcog_hits (score, evalue, smcog_id, cds_id)"
-                "VALUES (%s, %s, %s, %s)", (smcog_score, smcog_evalue, smcog_id, cds_id))
+    cur.execute(
+        "INSERT INTO antismash.smcog_hits (score, evalue, smcog_id, cds_id)"
+        "VALUES (?, ?, ?, ?)",
+        (smcog_score, smcog_evalue, smcog_id, cds_id),
+    )
 
 
 def create_profile_hits(data, cds):
     """Create profile hit entries for a feature."""
     detected_domains = parse_domains_detected(cds)
     for domain in detected_domains:
-        domain['cds_id'] = data.feature_mapping[cds]
-        try:
-            data.insert("""
+        domain["cds_id"] = data.feature_mapping[cds]
+        # try:
+        params = (
+            domain["cds_id"],
+            domain["name"],
+            domain["evalue"],
+            domain["bitscore"],
+            domain["seeds"],
+        )
+        data.insert(
+            """
 INSERT INTO antismash.profile_hits (cds_id, name, evalue, bitscore, seeds)
-VALUES (%(cds_id)s, %(name)s, %(evalue)s, %(bitscore)s, %(seeds)s)""", domain)
-        except psycopg2.IntegrityError:
-            print(cds)
-            print(domain)
-            raise
+VALUES (?, ?, ?, ?, ?)""",
+            params,
+        )
+        # except psycopg2.IntegrityError:
+        #    print(cds)
+        #    print(domain)
+        #    raise
 
 
 def parse_domains_detected(feature):
@@ -307,10 +391,10 @@ def parse_domains_detected(feature):
 
     for domain in feature.sec_met.domains:
         dom = {}
-        dom['name'] = domain.name
-        dom['evalue'] = domain.evalue
-        dom['bitscore'] = domain.bitscore
-        dom['seeds'] = domain.nseeds
+        dom["name"] = domain.name
+        dom["evalue"] = domain.evalue
+        dom["bitscore"] = domain.bitscore
+        dom["seeds"] = domain.nseeds
         domains.append(dom)
 
     return domains
@@ -318,7 +402,7 @@ def parse_domains_detected(feature):
 
 def get_smcog_id(cur, smcog):
     """Get the smcog_id given the smCOG identifier in a feature."""
-    cur.execute("SELECT smcog_id FROM antismash.smcogs WHERE name = %s", (smcog,))
+    cur.execute("SELECT smcog_id FROM antismash.smcogs WHERE name = ?", (smcog,))
     ret = cur.fetchone()
     if ret is None:
         raise ValueError("could not find matching smCOG entry for: %s" % smcog)
@@ -331,7 +415,9 @@ def handle_ripps(data):
         if protocluster.product not in RIPP_PRODUCTS:
             continue
         for motif in data.record.get_cds_motifs():
-            if motif.overlaps_with(protocluster) and isinstance(motif, antismash.common.secmet.Prepeptide):
+            if motif.overlaps_with(protocluster) and isinstance(
+                motif, antismash.common.secmet.Prepeptide
+            ):
                 handle_ripp(data, protocluster, motif)
 
 
@@ -347,14 +433,28 @@ def handle_ripp(data, protocluster, motif):
         return
 
     params = defaultdict(lambda: None)
-    params['protocluster_id'] = data.feature_mapping[protocluster]
-    params['locus_tag'] = locus_tag
-    params['cds_id'] = data.feature_mapping[data.record.get_cds_by_name(locus_tag)]
+    params["protocluster_id"] = data.feature_mapping[protocluster]
+    params["locus_tag"] = locus_tag
+    params["cds_id"] = data.feature_mapping[data.record.get_cds_by_name(locus_tag)]
     parse_ripp_core(motif, params)
-    if params['peptide_sequence'] is None:
+    if params["peptide_sequence"] is None:
         return
     assert params["bridges"] is None or isinstance(params["bridges"], int), params
-    data.insert("""
+    parameters = (
+        params["protocluster_id"],
+        params["peptide_sequence"],
+        params["molecular_weight"],
+        params["monoisotopic_mass"],
+        params["alternative_weights"],
+        params["bridges"],
+        params["class"],
+        params["subclass"],
+        params["score"],
+        params["locus_tag"],
+        params["cds_id"],
+    )
+    data.insert(
+        """
 INSERT INTO antismash.ripps (
     protocluster_id,
     peptide_sequence,
@@ -368,78 +468,106 @@ INSERT INTO antismash.ripps (
     locus_tag,
     cds_id
 ) VALUES (
-    %(protocluster_id)s,
-    %(peptide_sequence)s,
-    %(molecular_weight)s,
-    %(monoisotopic_mass)s,
-    %(alternative_weights)s,
-    %(bridges)s,
-    %(class)s,
-    %(subclass)s,
-    %(score)s,
-    %(locus_tag)s,
-    %(cds_id)s
-)""", params)
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+)""",
+        parameters,
+    )
 
 
 def parse_ripp_core(feature, params):
     """Parse RIPP core features."""
-    params['monoisotopic_mass'] = feature.monoisotopic_mass
-    params['molecular_weight'] = feature.molecular_weight
-    params['alternative_weights'] = str(feature.alternative_weights)
-    params['class'] = feature.peptide_class
-    params['subclass'] = feature.peptide_subclass
-    params['score'] = feature.score
-    params['peptide_sequence'] = feature.core
+    params["monoisotopic_mass"] = feature.monoisotopic_mass
+    params["molecular_weight"] = feature.molecular_weight
+    params["alternative_weights"] = str(feature.alternative_weights)
+    params["class"] = feature.peptide_class
+    params["subclass"] = feature.peptide_subclass
+    params["score"] = feature.score
+    params["peptide_sequence"] = feature.core
     if feature.detailed_information:
         # go for a generic approach, since the detail qualifiers vary
-        bridges = feature.detailed_information.to_biopython_qualifiers().get("number_of_bridges", [None])[0]
+        bridges = feature.detailed_information.to_biopython_qualifiers().get(
+            "number_of_bridges", [None]
+        )[0]
         if bridges is not None:
             params["bridges"] = int(bridges)
 
 
 def handle_as_domain_subtype(data, as_domain_id: int, subtype: str) -> None:
+    logging.debug(f"RUNNING: def handle_as_domain_subtype {as_domain_id} {subtype}...")
     """ Link domains to their subtypes """
     assert as_domain_id
     assert subtype
 
     # ensure the subtype is present in the subtype table
-    data.cursor.execute("SELECT subtype FROM antismash.as_domain_subtypes WHERE subtype = %s", (subtype,))
+    data.cursor.execute(
+        "SELECT subtype FROM antismash.as_domain_subtypes WHERE subtype = ?", (subtype,)
+    )
     if not data.cursor.fetchone():
-        print("inserting new aSDomain subtype:", subtype)
-        data.insert("INSERT INTO antismash.as_domain_subtypes (subtype, description) VALUES "
-                    "(%s, %s)", (subtype, ""))  # TODO add meaningful descriptions or just build this up as a static thing
-    data.insert("INSERT INTO antismash.rel_as_domain_to_subtype (as_domain_id, subtype) VALUES (%s, %s)",
-                (as_domain_id, subtype))
+        logging.debug(f"Inserting new aSDomain subtype: {subtype}")
+        data.insert(
+            "INSERT INTO antismash.as_domain_subtypes (subtype, description) VALUES "
+            "(?, ?)",
+            (subtype, ""),
+        )  # TODO add meaningful descriptions or just build this up as a static thing
+    data.insert(
+        "INSERT INTO antismash.rel_as_domain_to_subtype (as_domain_id, subtype) VALUES (?, ?)",
+        (as_domain_id, subtype),
+    )
 
 
-def handle_asdomain(data, domain, module_id, function_id, predictions: dict[str, Prediction], follows):
+def handle_asdomain(
+    data, domain, module_id, function_id, predictions: dict[str, Prediction], follows
+):
     """Handle aSDomain features."""
     params = {}
-    params['pks_signature'] = None
-    params['minowa'] = None
-    params['nrps_predictor'] = None
-    params['stachelhaus'] = None
-    params['consensus'] = None
-    params['kr_activity'] = None
-    params['kr_stereochemistry'] = None
-    params['location'] = str(domain.location)
+    params["pks_signature"] = None
+    params["minowa"] = None
+    params["nrps_predictor"] = None
+    params["stachelhaus"] = None
+    params["consensus"] = None
+    params["kr_activity"] = None
+    params["kr_stereochemistry"] = None
+    params["location"] = str(domain.location)
 
-    params['score'] = domain.score
-    params['evalue'] = domain.evalue
-    params['translation'] = domain.translation
-    params['locus_tag'] = domain.locus_tag
-    params['cds_id'] = data.feature_mapping[data.record.get_cds_by_name(domain.locus_tag)]
-    params['detection'] = domain.detection
-    params['as_domain_profile_id'] = get_as_domain_profile_id(data.cursor, domain.domain)
-    params['function_id'] = function_id
-    params['module_id'] = module_id
-    params['follows'] = follows
+    params["score"] = domain.score
+    params["evalue"] = domain.evalue
+    params["translation"] = domain.translation
+    params["locus_tag"] = domain.locus_tag
+    params["cds_id"] = data.feature_mapping[
+        data.record.get_cds_by_name(domain.locus_tag)
+    ]
+    params["detection"] = domain.detection
+    params["as_domain_profile_id"] = get_as_domain_profile_id(
+        data.cursor, domain.domain
+    )
+    params["function_id"] = function_id
+    params["module_id"] = module_id
+    params["follows"] = follows
 
     parse_specificity(domain, params)
 
-    try:
-        as_domain_id = data.insert("""
+    # try:
+    parameters = (
+        params["detection"],
+        params["score"],
+        params["evalue"],
+        params["translation"],
+        params["pks_signature"],
+        params["minowa"],
+        params["nrps_predictor"],
+        params["stachelhaus"],
+        params["consensus"],
+        params["kr_activity"],
+        params["kr_stereochemistry"],
+        params["as_domain_profile_id"],
+        params["location"],
+        params["cds_id"],
+        params["module_id"],
+        params["function_id"],
+        params["follows"],
+    )
+    as_domain_id = data.insert(
+        """
 INSERT INTO antismash.as_domains (
     detection,
     score,
@@ -459,41 +587,30 @@ INSERT INTO antismash.as_domains (
     function_id,
     follows
 ) VALUES (
-    %(detection)s,
-    %(score)s,
-    %(evalue)s,
-    %(translation)s,
-    %(pks_signature)s,
-    %(minowa)s,
-    %(nrps_predictor)s,
-    %(stachelhaus)s,
-    %(consensus)s,
-    %(kr_activity)s,
-    %(kr_stereochemistry)s,
-    %(as_domain_profile_id)s,
-    %(location)s,
-    %(cds_id)s,
-    %(module_id)s,
-    %(function_id)s,
-    %(follows)s
-) RETURNING as_domain_id""", params)
-    except psycopg2.ProgrammingError:
-        print("error fetching cds_id for locus_tag", params['locus_tag'])
-        raise
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+) RETURNING as_domain_id""",
+        parameters,
+    )
+    # except psycopg2.ProgrammingError:
+    #    print("error fetching cds_id for locus_tag", params["locus_tag"])
+    #    raise
     data.feature_mapping[domain] = as_domain_id
 
     for subtype in domain.subtypes:
         handle_as_domain_subtype(data, as_domain_id, subtype)
 
-    if params['consensus'] is None:
+    if params["consensus"] is None:
         return as_domain_id
 
     substrates = params["consensus"].split("|")
     for substrate in substrates:
         substrate_id = get_substrate(data.cursor, substrate)
         assert substrate_id is not None
-        data.insert("INSERT INTO antismash.rel_as_domains_substrates (as_domain_id, substrate_id) VALUES "
-                    "(%s, %s)", (as_domain_id, substrate_id))
+        data.insert(
+            "INSERT INTO antismash.rel_as_domains_substrates (as_domain_id, substrate_id) VALUES "
+            "(?, ?)",
+            (as_domain_id, substrate_id),
+        )
     return as_domain_id
 
 
@@ -502,10 +619,13 @@ def get_as_domain_profile_id(cur, name):
     if name is None:
         return None
 
-    cur.execute("SELECT as_domain_profile_id FROM antismash.as_domain_profiles WHERE name = %s", (name, ))
+    cur.execute(
+        "SELECT as_domain_profile_id FROM antismash.as_domain_profiles WHERE name = ?",
+        (name,),
+    )
     ret = cur.fetchone()
     if ret is None:
-        raise ValueError('Invalid asDomain name {!r}'.format(name))
+        raise ValueError("Invalid asDomain name {!r}".format(name))
 
     return ret[0]
 
@@ -522,7 +642,7 @@ SUBSTRATE_TRANSLATIONS = {
 def get_substrate(cur, name):
     """Get the substrate_id for a substrate by name."""
     name = get_substrate_by_name(SUBSTRATE_TRANSLATIONS.get(name, name)).short
-    cur.execute("SELECT substrate_id FROM antismash.substrates WHERE name = %s", (name,))
+    cur.execute("SELECT substrate_id FROM antismash.substrates WHERE name = ?", (name,))
     ret = cur.fetchone()
     if ret is None:
         raise ValueError("missing substrate in substrates table:", name)
@@ -531,15 +651,23 @@ def get_substrate(cur, name):
 
 def get_or_create_monomer(cur, name, substrate_id, modified):
     """Get the monomer_id for a monomer by name, create monomer entry if needed."""
-    cur.execute("SELECT monomer_id FROM antismash.monomers WHERE name = %s", (name.lower(),))
+    cur.execute(
+        "SELECT monomer_id FROM antismash.monomers WHERE name = ?", (name.lower(),)
+    )
     ret = cur.fetchone()
     if ret:
         return ret[0]
-    cur.execute("SELECT description FROM antismash.substrates WHERE substrate_id = %s", (substrate_id,))
+    cur.execute(
+        "SELECT description FROM antismash.substrates WHERE substrate_id = ?",
+        (substrate_id,),
+    )
     ret = cur.fetchone()
     desc = ("modified " if modified else "") + ret[0]
     print("inserting new monomer:", name, " -> ", desc)
-    cur.execute("INSERT INTO antismash.monomers (substrate_id, name, description) VALUES (%s, %s, %s) RETURNING monomer_id", (substrate_id, name.lower(), desc))
+    cur.execute(
+        "INSERT INTO antismash.monomers (substrate_id, name, description) VALUES (?, ?, ?) RETURNING monomer_id",
+        (substrate_id, name.lower(), desc),
+    )
     return cur.fetchone()[0]
 
 
@@ -550,20 +678,20 @@ def parse_specificity(feature, params):
         # drop any prediction which has no actual result
         if pred == antismash.modules.nrps_pks.results.UNKNOWN:
             continue
-        if method == 'KR activity':
-            params['kr_activity'] = not pred.endswith('inactive')
-        elif method == 'KR stereochemistry':
-            params['kr_stereochemistry'] = pred
-        elif method == 'NRPSpredictor':
-            params['nrps_predictor'] = pred
-        elif method == 'Stachelhaus':
-            params['stachelhaus'] = pred
-        elif method == 'Minowa':
-            params['minowa'] = pred
-        elif method == 'PKS signature':
-            params['pks_signature'] = pred
-        elif method == 'substrate consensus':
-            params['consensus'] = pred
+        if method == "KR activity":
+            params["kr_activity"] = not pred.endswith("inactive")
+        elif method == "KR stereochemistry":
+            params["kr_stereochemistry"] = pred
+        elif method == "NRPSpredictor":
+            params["nrps_predictor"] = pred
+        elif method == "Stachelhaus":
+            params["stachelhaus"] = pred
+        elif method == "Minowa":
+            params["minowa"] = pred
+        elif method == "PKS signature":
+            params["pks_signature"] = pred
+        elif method == "substrate consensus":
+            params["consensus"] = pred
         elif method == "transATor":
             pass  # covered by generic domain subtype handling, but prevent the fallback error
         else:
@@ -574,27 +702,38 @@ def handle_region(data, sequence_id, region):
     """Handle cluster features."""
     assert region
     params = defaultdict(lambda: None)
-    params['contig_edge'] = region.contig_edge
-    params['location'] = str(region.location)
-    params['start_pos'] = int(region.location.start)
-    params['end_pos'] = int(region.location.end)
-    params['sequence_id'] = sequence_id
+    params["contig_edge"] = region.contig_edge
+    params["location"] = str(region.location)
+    params["start_pos"] = int(region.location.start)
+    params["end_pos"] = int(region.location.end)
+    params["sequence_id"] = sequence_id
     params["region_number"] = region.get_region_number()
 
-    region_id = data.insert("""
+    parameters = (
+        params["region_number"],
+        params["sequence_id"],
+        params["location"],
+        params["start_pos"],
+        params["end_pos"],
+        params["contig_edge"],
+    )
+    region_id = data.insert(
+        """
 INSERT INTO antismash.regions (region_number, accession, location, start_pos, end_pos, contig_edge)
-VALUES (%(region_number)s, %(sequence_id)s, %(location)s, %(start_pos)s, %(end_pos)s, %(contig_edge)s)
-RETURNING region_id""", params)
-    params['region_id'] = region_id
+VALUES (?, ?, ?, ?, ?, ?)
+RETURNING region_id""",
+        parameters,
+    )
+    params["region_id"] = region_id
     data.feature_mapping[region] = region_id
     data.current_region = region
 
     for product in region.products:
         product = product.lower()
-        try:
-            nx_create_rel_regions_types(data.cursor, params, product)
-        except psycopg2.IntegrityError:
-            raise RuntimeError("no definition in schema for product type: %s" % product)
+        # try:
+        nx_create_rel_regions_types(data.cursor, params, product)
+        # except psycopg2.IntegrityError:
+        #    raise RuntimeError("no definition in schema for product type: %" % product)
 
     for cds in region.cds_children:
         handle_cds(data, region_id, cds)
@@ -617,7 +756,9 @@ RETURNING region_id""", params)
 def handle_region_nrpspks(data):
     if not hasattr(handle_region_nrpspks, "_domain_function_mapping"):
         data.cursor.execute("SELECT * FROM antismash.module_domain_functions")
-        handle_region_nrpspks._domain_function_mapping = {func: func_id for func_id, func in data.cursor.fetchall()}
+        handle_region_nrpspks._domain_function_mapping = {
+            func: func_id for func_id, func in data.cursor.fetchall()
+        }
 
     function_ids = handle_region_nrpspks._domain_function_mapping
 
@@ -634,10 +775,15 @@ def handle_region_nrpspks(data):
         previous = None
         module_id = None
         function = None
-        domains = sorted(domain_results.cds_results[cds].domain_features.values(), reverse=cds.location.strand == -1)
+        domains = sorted(
+            domain_results.cds_results[cds].domain_features.values(),
+            reverse=cds.location.strand == -1,
+        )
         for domain in domains:
             predictions = domain_predictions[domain.domain_id]
-            previous = handle_asdomain(data, domain, module_id, function, predictions, follows=previous)
+            previous = handle_asdomain(
+                data, domain, module_id, function, predictions, follows=previous
+            )
             domains_to_id[domain] = previous
 
     # then do a second pass, now that cross-CDS modules won't attempt to refer
@@ -648,14 +794,29 @@ def handle_region_nrpspks(data):
         cds_domain_results = domain_results.cds_results[cds]
         cds_modules = cds.modules
         # if the first or last module is a cross-CDS module, don't reprocess it
-        if cds_modules[0].is_multigene_module() and cds.get_name() != cds_modules[0].parent_cds_names[0]:
+        if (
+            cds_modules[0].is_multigene_module()
+            and cds.get_name() != cds_modules[0].parent_cds_names[0]
+        ):
             cds_modules = cds_modules[1:]
-        if cds_modules and cds_modules[-1].is_multigene_module() and cds.get_name() != cds_modules[-1].parent_cds_names[0]:
+        if (
+            cds_modules
+            and cds_modules[-1].is_multigene_module()
+            and cds.get_name() != cds_modules[-1].parent_cds_names[0]
+        ):
             cds_modules = cds_modules[:-1]
         assert len(cds_modules) == len(cds_domain_results.modules)
         for module, raw_module in zip(cds_modules, cds_domain_results.modules):
             modules.append(module)
-            handle_module(data, raw_module, cds_domain_results, module, domains_to_id, function_ids, cds.get_name())
+            handle_module(
+                data,
+                raw_module,
+                cds_domain_results,
+                module,
+                domains_to_id,
+                function_ids,
+                cds.get_name(),
+            )
 
     if not modules:
         return
@@ -667,14 +828,25 @@ def handle_region_nrpspks(data):
     for candidate in data.current_region.candidate_clusters:
         for module in modules:
             if module.is_contained_by(candidate):
-                data.insert("INSERT INTO antismash.rel_candidates_modules (candidate_id, module_id) VALUES (%s, %s)",
-                            (data.feature_mapping[candidate], data.feature_mapping[module]))
+                data.insert(
+                    "INSERT INTO antismash.rel_candidates_modules (candidate_id, module_id) VALUES (?, ?)",
+                    (data.feature_mapping[candidate], data.feature_mapping[module]),
+                )
 
 
-def handle_module(data, raw_module, domain_results, secmet_module, domains_to_id, function_ids, cds_name):
+def handle_module(
+    data,
+    raw_module,
+    domain_results,
+    secmet_module,
+    domains_to_id,
+    function_ids,
+    cds_name,
+):
+    logging.debug(f"RUNNING: def handle_module {cds_name}...")
     statement = """
 INSERT INTO antismash.modules (location, type, complete, iterative, region_id, trans_at, multi_gene)
-VALUES (%(location)s, %(type)s, %(complete)s, %(iterative)s, %(region_id)s, %(trans_at)s, %(multi_gene)s)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 RETURNING module_id"""
     assert raw_module.is_trans_at() in [True, False]
     values = {
@@ -686,8 +858,17 @@ RETURNING module_id"""
         "trans_at": raw_module.is_trans_at(),
         "multi_gene": secmet_module.is_multigene_module(),
     }
-
-    module_id = data.insert(statement, values)
+    parameters = (
+        values["location"],
+        values["type"],
+        values["complete"],
+        values["iterative"],
+        values["region_id"],
+        values["trans_at"],
+        values["multi_gene"],
+    )
+    logging.debug(f"INSERTING: {parameters}")
+    module_id = data.insert(statement, parameters)
     data.feature_mapping[secmet_module] = module_id
 
     singles = {
@@ -696,7 +877,11 @@ RETURNING module_id"""
         "carrier_protein": raw_module._carrier_protein,
         "finalisation": raw_module._end,
     }
-    modification_components = {component.label for component in raw_module.components if component.is_modification()}
+    # modification_components = {
+    #    component.label
+    #    for component in raw_module.components
+    #    if component.is_modification()
+    # }
     assert len(secmet_module.domains) == len(raw_module.components)
     for domain, component in zip(secmet_module.domains, raw_module.components):
         domain_id = domains_to_id[domain]
@@ -708,25 +893,80 @@ RETURNING module_id"""
         else:
             if component.is_modification():
                 function = "modification"
-        update_statement = "UPDATE antismash.as_domains SET function_id = %s, module_id = %s WHERE as_domain_id = %d"
-        function_id = function_ids[function]
-        data.cursor.execute(update_statement % (function_id, module_id, domain_id))
+
+        update_statement = "UPDATE antismash.as_domains SET function_id = ?, module_id = ? WHERE as_domain_id = ?"
+        try:
+            data.cursor.execute(
+                update_statement, (function_ids[function], module_id, domain_id)
+            )
+        except duckdb.duckdb.ConstraintException as e:
+            # Handle Over-Eager Unique Constraint Checking
+            logging.warning(
+                f"Error updating as_domain due to Over-Eager Unique Constraint Checking in DuckDB:\n{e}"
+            )
+            logging.debug("Storing updated row as json for later insertion...")
+            # Step 1: Query the existing row
+            data.cursor.execute(
+                "SELECT * FROM antismash.as_domains WHERE as_domain_id = ?",
+                (domain_id,),
+            )
+            row = data.cursor.fetchone()
+            if row:
+                # Step 2: Convert the row to a dictionary
+                row_dict = dict(
+                    zip([column[0] for column in data.cursor.description], row)
+                )
+
+                # Step 3: Update the dictionary with new values
+                row_dict["function_id"] = function_ids[function]
+                row_dict["module_id"] = module_id
+
+                # Step 4: Append the updated dictionary to a JSON file
+                try:
+                    with open("as_domain_update.json", "r+") as f:
+                        try:
+                            updated_as_domain_row = json.load(f)
+                        except json.JSONDecodeError:
+                            updated_as_domain_row = []
+
+                        # Check if row_dict already exists with the same values
+                        exists = any(item == row_dict for item in updated_as_domain_row)
+
+                        if not exists:
+                            updated_as_domain_row.append(row_dict)
+                            f.seek(0)
+                            f.truncate()  # Clear the file before writing
+                            json.dump(updated_as_domain_row, f, indent=4)
+                        else:
+                            logging.debug(
+                                "The row already exists in the file with the same values."
+                            )
+                except FileNotFoundError:
+                    with open("as_domain_update.json", "w") as f:
+                        json.dump([row_dict], f, indent=4)
 
     # don't insert the module if the current CDS is not the first CDS of a multi-CDS module,
     # otherwise it'll duplicate
+    logging.debug(
+        "Check if module is complete and CDS is the first CDS of a multi-CDS module"
+    )
     if secmet_module.is_complete() and cds_name == secmet_module.parent_cds_names[0]:
         for substrate, monomer in set(secmet_module.get_substrate_monomer_pairs()):
             substrate_id = get_substrate(data.cursor, substrate)
             modified = substrate != monomer
-            monomer_id = get_or_create_monomer(data.cursor, monomer, substrate_id, modified)
+            monomer_id = get_or_create_monomer(
+                data.cursor, monomer, substrate_id, modified
+            )
             statement = """
 INSERT INTO antismash.rel_modules_monomers (module_id, substrate, monomer)
-VALUES (%s, %s, %s)"""
+VALUES (?, ?, ?)"""
             data.insert(statement, (module_id, substrate_id, monomer_id))
 
 
 def get_product_id(cur, product):
-    cur.execute("SELECT bgc_type_id FROM antismash.bgc_types WHERE term = %s", (product.lower(),))
+    cur.execute(
+        "SELECT bgc_type_id FROM antismash.bgc_types WHERE term = ?", (product.lower(),)
+    )
     ret = cur.fetchone()
     if ret is None:
         raise ValueError("missing product type from products table:", product)
@@ -737,42 +977,63 @@ def handle_candidate(data, candidate):
     polymer = None
     nrps_results = data.module_results.get(antismash.modules.nrps_pks.__name__)
     if nrps_results:
-        for cand_result in nrps_results.region_predictions[data.current_region.get_region_number()]:
-            if cand_result.candidate_cluster_number == candidate.get_candidate_cluster_number():
+        for cand_result in nrps_results.region_predictions[
+            data.current_region.get_region_number()
+        ]:
+            if (
+                cand_result.candidate_cluster_number
+                == candidate.get_candidate_cluster_number()
+            ):
                 polymer = cand_result.polymer
                 break
 
     if candidate.kind not in CANDIDATE_KINDS:
         data.cursor.execute(
-            "SELECT candidate_type_id FROM antismash.candidate_types WHERE description = %s",
-            (str(candidate.kind).replace("_", " "),)
+            "SELECT candidate_type_id FROM antismash.candidate_types WHERE description = ?",
+            (str(candidate.kind).replace("_", " "),),
         )
         kind_id = data.cursor.fetchone()
         assert kind_id is not None
         CANDIDATE_KINDS[candidate.kind] = kind_id
     else:
         kind_id = CANDIDATE_KINDS[candidate.kind]
-    candidate_id = data.insert("""
+    candidate_id = data.insert(
+        """
 INSERT INTO antismash.candidates (region_id, location, candidate_type_id, smiles, polymer)
-VALUES (%s, %s, %s, %s, %s)
+VALUES (?, ?, ?, ?, ?)
 RETURNING candidate_id""",
-                               (data.current_region_id, str(candidate.location),
-                               kind_id,
-                               candidate.smiles_structure, polymer))
+        (
+            data.current_region_id,
+            str(candidate.location),
+            kind_id[0],
+            candidate.smiles_structure,
+            polymer,
+        ),
+    )
     data.feature_mapping[candidate] = candidate_id
 
     for product in candidate.products:
-        data.cursor.execute("""
+        data.cursor.execute(
+            """
 INSERT INTO antismash.rel_candidates_types (candidate_id, bgc_type_id)
-VALUES (%s, %s)""", (candidate_id, get_product_id(data.cursor, product)))
+VALUES (?, ?)""",
+            (candidate_id, get_product_id(data.cursor, product)),
+        )
 
 
 def handle_protocluster(data, protocluster):
     product_id = get_product_id(data.cursor, protocluster.product)
-    protocluster_id = data.insert("""
+    protocluster_id = data.insert(
+        """
 INSERT INTO antismash.protoclusters (region_id, location, bgc_type_id)
-VALUES (%s, %s, %s)
-RETURNING protocluster_id""", (data.feature_mapping[data.current_region], str(protocluster.location), product_id))
+VALUES (?, ?, ?)
+RETURNING protocluster_id""",
+        (
+            data.feature_mapping[data.current_region],
+            str(protocluster.location),
+            product_id,
+        ),
+    )
     data.feature_mapping[protocluster] = protocluster_id
 
 
@@ -781,9 +1042,12 @@ def link_proto_to_candidates(data):
         cand_id = data.feature_mapping[candidate]
         for proto in candidate.protoclusters:
             proto_id = data.feature_mapping[proto]
-            data.insert("""
+            data.insert(
+                """
 INSERT INTO antismash.rel_candidates_protoclusters (candidate_id, protocluster_id)
-VALUES (%s, %s)""", (cand_id, proto_id))
+VALUES (?, ?)""",
+                (cand_id, proto_id),
+            )
 
 
 def nx_create_rel_regions_types(cur, params, product):
@@ -791,27 +1055,37 @@ def nx_create_rel_regions_types(cur, params, product):
     assert params.get("region_id")
     assert product
     product_id = get_product_id(cur, product)
-    cur.execute("""
-SELECT * FROM antismash.rel_regions_types WHERE region_id = %s AND
-    bgc_type_id = %s""", (params['region_id'], product_id))
+    cur.execute(
+        """
+SELECT * FROM antismash.rel_regions_types WHERE region_id = ? AND
+    bgc_type_id = ?""",
+        (params["region_id"], product_id),
+    )
     ret = cur.fetchone()
     if ret is None:
-        cur.execute("""
+        cur.execute(
+            """
 INSERT INTO antismash.rel_regions_types (region_id, bgc_type_id)
-VALUES (%s, %s)""", (params['region_id'], product_id))
+VALUES (?, ?)""",
+            (params["region_id"], product_id),
+        )
 
 
 def handle_t2pks(data, protocluster):
     protocluster_id = data.feature_mapping[protocluster]
-    t2pks_id = data.insert("INSERT INTO antismash.t2pks (protocluster_id) VALUES (%s) RETURNING t2pks_id",
-                           (protocluster_id,))
+    t2pks_id = data.insert(
+        "INSERT INTO antismash.t2pks (protocluster_id) VALUES (?) RETURNING t2pks_id",
+        (protocluster_id,),
+    )
 
-    t2pks_results = data.module_results[antismash.modules.t2pks.__name__].cluster_predictions[protocluster.get_protocluster_number()]
+    t2pks_results = data.module_results[
+        antismash.modules.t2pks.__name__
+    ].cluster_predictions[protocluster.get_protocluster_number()]
 
     for starter in t2pks_results.starter_units:
         statement = """
 INSERT INTO antismash.t2pks_starters (t2pks_id, name, evalue, bitscore)
-VALUES (%(t2pks_id)s, %(name)s, %(evalue)s, %(bitscore)s)
+VALUES (?, ?, ?, ?)
 RETURNING domain_id"""
         values = {
             "t2pks_id": t2pks_id,
@@ -819,18 +1093,26 @@ RETURNING domain_id"""
             "evalue": starter.evalue,
             "bitscore": starter.score,
         }
-        starter_id = data.insert(statement, values)
+        parameters = (
+            values["t2pks_id"],
+            values["name"],
+            values["evalue"],
+            values["bitscore"],
+        )
+        starter_id = data.insert(statement, parameters)
         for elongation_joined in t2pks_results.malonyl_elongations:
             for elongation in elongation_joined.name.split("|"):
                 try:
-                    weight = t2pks_results.molecular_weights["%s_%s" % (starter.name, elongation)]
+                    weight = t2pks_results.molecular_weights[
+                        "%s_%s" % (starter.name, elongation)
+                    ]
                 except KeyError:
                     print(t2pks_results.molecular_weights)
                     raise
                 elongation_count = int(elongation)
                 statement = """
     INSERT INTO antismash.t2pks_starter_elongation (domain_id, elongation, weight)
-    VALUES (%s, %s, %s)
+    VALUES (?, ?, ?)
     RETURNING combo_id"""
                 data.insert(statement, (starter_id, elongation_count, weight))
 
@@ -838,12 +1120,15 @@ RETURNING domain_id"""
         cds_id = data.feature_mapping[data.record.get_cds_by_name(cds_name)]
         assert cds_id, cds_id
         for cds_result in cds_results:
-            data.cursor.execute("SELECT profile_id FROM antismash.t2pks_profiles WHERE name = %s", (cds_result.ptype,))
+            data.cursor.execute(
+                "SELECT profile_id FROM antismash.t2pks_profiles WHERE name = ?",
+                (cds_result.ptype,),
+            )
             profile_id = data.cursor.fetchone()[0]
 
             statement = """
 INSERT INTO antismash.t2pks_cds_domain (t2pks_id, cds_id, profile_id, protein_type, protein_function, evalue, bitscore)
-VALUES (%(t2pks_id)s, %(cds_id)s, %(profile_id)s, %(ptype)s, %(pfunc)s, %(evalue)s, %(score)s)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 RETURNING domain_id"""
             values = {
                 "t2pks_id": t2pks_id,
@@ -854,72 +1139,109 @@ RETURNING domain_id"""
                 "evalue": cds_result.evalue,
                 "score": cds_result.bitscore,
             }
-            data.insert(statement, values)
+            parameters = (
+                values["t2pks_id"],
+                values["cds_id"],
+                values["profile_id"],
+                values["ptype"],
+                values["pfunc"],
+                values["evalue"],
+                values["score"],
+            )
+            data.insert(statement, parameters)
 
     for product in sorted(t2pks_results.product_classes):
         statement = """
 INSERT INTO antismash.t2pks_product_classes (t2pks_id, product_class)
-VALUES (%s, %s)"""
+VALUES (?, ?)"""
         data.insert(statement, (t2pks_id, product))
 
 
 def get_or_create_tax_id(cur, name, ncbi_taxid, strain):
     """Get the tax_id or create a new one."""
+    logging.debug("RUNNING: def get_or_create_tax_id...")
     combined_name = f"{name} {strain}"
-    cur.execute("SELECT tax_id FROM antismash.taxa WHERE name = %s AND ncbi_taxid = %s", (combined_name, ncbi_taxid))
+    cur.execute(
+        "SELECT tax_id FROM antismash.taxa WHERE name = ? AND ncbi_taxid = ?",
+        (combined_name, ncbi_taxid),
+    )
     ret = cur.fetchone()
     if ret is None:
         lineage = get_lineage(ncbi_taxid)
-        lineage['ncbi_taxid'] = ncbi_taxid
-        lineage['name'] = combined_name
-        lineage['strain'] = strain
+        lineage["ncbi_taxid"] = ncbi_taxid
+        lineage["name"] = combined_name
+        lineage["strain"] = strain
         try:
-            cur.execute("""
+            parameters = (
+                lineage["ncbi_taxid"],
+                lineage["superkingdom"],
+                lineage["kingdom"],
+                lineage["phylum"],
+                lineage["class"],
+                lineage["order"],
+                lineage["family"],
+                lineage["genus"],
+                lineage["species"],
+                lineage["strain"],
+                lineage["name"],
+            )
+            cur.execute(
+                """
 INSERT INTO antismash.taxa (ncbi_taxid, superkingdom, kingdom, phylum, class, taxonomic_order, family, genus, species, strain, name) VALUES
-    (%(ncbi_taxid)s, %(superkingdom)s, %(kingdom)s, %(phylum)s, %(class)s, %(order)s, %(family)s, %(genus)s, %(species)s, %(strain)s, %(name)s) RETURNING tax_id""",
-                        lineage)
+    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING tax_id""",
+                parameters,
+            )
         except KeyError:
-            print('Error inserting {!r}'.format(lineage))
+            print("Error inserting {!r}".format(lineage))
             raise
         ret = cur.fetchone()
     return ret
 
 
 def get_lineage(taxid):
+    logging.debug("RUNNING: def get_lineage...")
     """Get the full lineage for a taxid from Entrez."""
-    info = TAX_DUMP["mappings"].get(str(TAX_DUMP["deprecated_ids"].get(str(taxid), taxid)))
+    info = TAX_DUMP["mappings"].get(
+        str(TAX_DUMP["deprecated_ids"].get(str(taxid), taxid))
+    )
     if info:
         result = dict(info)
         result.pop("tax_id")
         return result
 
-    api_key = os.environ.get('ASDBI_ENTREZ_API_KEY', '')
+    api_key = os.environ.get("ASDBI_ENTREZ_API_KEY", "")
     extra_params = {}
     if api_key:
-        extra_params['api_key'] = api_key
+        extra_params["api_key"] = api_key
     retries = 5
     while retries > 0:
         try:
-            handle = Entrez.efetch(db="taxonomy", id=taxid, retmode="xml", **extra_params)
+            handle = Entrez.efetch(
+                db="taxonomy", id=taxid, retmode="xml", **extra_params
+            )
             break
         except urllib.error.HTTPError as err:
             retries -= 1
             print("Got http error:", err, retries, "left")
 
     records = Entrez.read(handle)
-    lineage = defaultdict(lambda: 'Unclassified')
-    for entry in records[0]['LineageEx']:
-        if entry['Rank'] == 'no rank':
+    lineage = defaultdict(lambda: "Unclassified")
+    for entry in records[0]["LineageEx"]:
+        if entry["Rank"] == "no rank":
             continue
-        lineage[entry['Rank']] = entry['ScientificName'].split(' ')[-1]
+        lineage[entry["Rank"]] = entry["ScientificName"].split(" ")[-1]
 
-    if 'species' not in lineage and 'ScientificName' in records[0] and len(records[0]['ScientificName'].split()) == 2:
-        lineage['species'] = records[0]['ScientificName'].split()[-1]
+    if (
+        "species" not in lineage
+        and "ScientificName" in records[0]
+        and len(records[0]["ScientificName"].split()) == 2
+    ):
+        lineage["species"] = records[0]["ScientificName"].split()[-1]
     return lineage
 
 
 def test_delete():
-    connection = psycopg2.connect(DB_CONNECTION)
+    connection = duckdb.connect(DB_CONNECTION)
     with connection.cursor() as cursor:
         cursor.execute("SELECT * FROM antismash.genomes")
         existing = cursor.fetchall()
@@ -938,40 +1260,42 @@ def test_delete():
             print("no existing genomes")
 
         print("tables with entries remaining:")
-        tables = sorted([
-            "filenames",
-            "t2pks_starter_elongation",
-            "genomes",
-            "t2pks_starters",
-            "t2pks",
-            "t2pks_product_classes",
-            "dna_sequences",
-            "ripps",
-            "t2pks_cds_domain",
-            "monomers",
-            "tta_codons",
-            "rel_modules_monomers",
-            "regions",
-            "module_modifications",
-            "rel_as_domains_substrates",
-            "protoclusters",
-            "rel_regions_types",
-            "candidates",
-            "rel_candidates_protoclusters",
-            "rel_candidates_types",
-            "modules",
-            "rel_candidates_modules",
-            "clusterblast_hits",
-            "profile_hits",
-            "as_domains",
-            "smcog_hits",
-            "cdss",
-            "genes",
-            "pfam_domains",
-            "pfam_go_entries",
-        ])
+        tables = sorted(
+            [
+                "filenames",
+                "t2pks_starter_elongation",
+                "genomes",
+                "t2pks_starters",
+                "t2pks",
+                "t2pks_product_classes",
+                "dna_sequences",
+                "ripps",
+                "t2pks_cds_domain",
+                "monomers",
+                "tta_codons",
+                "rel_modules_monomers",
+                "regions",
+                "module_modifications",
+                "rel_as_domains_substrates",
+                "protoclusters",
+                "rel_regions_types",
+                "candidates",
+                "rel_candidates_protoclusters",
+                "rel_candidates_types",
+                "modules",
+                "rel_candidates_modules",
+                "clusterblast_hits",
+                "profile_hits",
+                "as_domains",
+                "smcog_hits",
+                "cdss",
+                "genes",
+                "pfam_domains",
+                "pfam_go_entries",
+            ]
+        )
         for table in tables:
-            cursor.execute("SELECT COUNT(*) FROM antismash.%s" % table)
+            cursor.execute("SELECT COUNT(*) FROM antismash.?" % table)
             count = cursor.fetchone()[0]
             if count > 0:
                 print("", table, count)
@@ -982,17 +1306,49 @@ def test_delete():
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument('--db', default=DB_CONNECTION, help="DB connection string to use (default: %(default)s)")
-    parser.add_argument('--taxonomy', type=FileType("r"), help="Taxonomy dump as JSON")
-    parser.add_argument('--from-filelist', action="store_true", default=False, help="Passed filename is a list of filenames")
-    parser.add_argument('--success-log', type=FileType("a", encoding="utf-8"), default=None,
-                        help="File to store successfully imported file names in")
-    parser.add_argument('--error-log', type=FileType('a', encoding="utf-8"), default=None,
-                        help="File to store file names that failed to import in")
-    parser.add_argument('filenames', nargs="*")
+    parser.add_argument(
+        "--db",
+        default=DB_CONNECTION,
+        help="DB connection string to use (default: %(default)s)",
+    )
+    parser.add_argument("--taxonomy", type=FileType("r"), help="Taxonomy dump as JSON")
+    parser.add_argument(
+        "--from-filelist",
+        action="store_true",
+        default=False,
+        help="Passed filename is a list of filenames",
+    )
+    parser.add_argument(
+        "--success-log",
+        type=FileType("a", encoding="utf-8"),
+        default=None,
+        help="File to store successfully imported file names in",
+    )
+    parser.add_argument(
+        "--error-log",
+        type=FileType("a", encoding="utf-8"),
+        default=None,
+        help="File to store file names that failed to import in",
+    )
+    parser.add_argument(
+        "--allowed_assembly_prefix",
+        default="GCF,GCA",
+        help="Allowed assembly prefixes (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--ignore_check",
+        action="store_true",
+        default=False,
+        help="Ignore check (default: %(default)s)",
+    )
+    parser.add_argument("filenames", nargs="*")
     args = parser.parse_args()
 
-    TAX_DUMP = json.load(args.taxonomy) if args.taxonomy else {"mappings":{}, "deprecated_ids":{}}
+    TAX_DUMP = (
+        json.load(args.taxonomy)
+        if args.taxonomy
+        else {"mappings": {}, "deprecated_ids": {}}
+    )
 
     total_duration = 0
     total_imports = 0
@@ -1003,14 +1359,19 @@ if __name__ == "__main__":
     if args.from_filelist:
         filenames = []
         for filename in args.filenames:
-            with open(filename, 'r', encoding="utf-8") as handle:
+            with open(filename, "r", encoding="utf-8") as handle:
                 content = handle.read()
                 filenames.extend(content.splitlines())
 
     for filename in filenames:
         start_time = time.time()
         try:
-            main(filename, args.db)
+            main(
+                filename,
+                args.db,
+                allowed_assembly_prefix=args.allowed_assembly_prefix,
+                ignore_check=args.ignore_check,
+            )
             successful_imports += 1
             if args.success_log:
                 print(filename, file=args.success_log)
@@ -1031,5 +1392,9 @@ if __name__ == "__main__":
             print("took", round(import_duration, 2), "seconds", end="\t")
             total_imports += 1
             total_duration += import_duration
-            print("average:", round(total_duration/total_imports, 2), f"for {total_imports} total imports ({successful_imports} successful)")
+            print(
+                "average:",
+                round(total_duration / total_imports, 2),
+                f"for {total_imports} total imports ({successful_imports} successful)",
+            )
     sys.exit(1 if failed else 0)
