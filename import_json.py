@@ -24,11 +24,6 @@ from dbimporter.modules import cluster_compare, clusterblast, pfams, tfbs, tigrf
 
 # pylint: disable=line-too-long,missing-docstring
 
-
-log_format = "%(levelname)-8s %(asctime)s   %(message)s"
-date_format = "%d/%m %H:%M:%S"
-logging.basicConfig(format=log_format, datefmt=date_format, level=logging.DEBUG)
-
 DB_CONNECTION = "antismash_db.duckdb"
 Entrez.email = "matinnu@biosustain.dtu.dk"
 REPORTED_TYPES = set()
@@ -68,13 +63,16 @@ def main(
     with connection.cursor() as cursor:
         try:
             short_name, _ = os.path.splitext(os.path.basename(filename))
-            id_parts = short_name.split("_")
             allowed_assembly_prefix = [
                 prefix.strip() for prefix in allowed_assembly_prefix.split(",")
             ]
-            if id_parts[0] not in allowed_assembly_prefix:
-                raise MissingAssemblyIdError("assembly ID does begin with 'GCF'/'GCA'")
-            assembly_id = "_".join(id_parts[:2])
+            if not any(
+                short_name.startswith(prefix) for prefix in allowed_assembly_prefix
+            ):
+                raise MissingAssemblyIdError(
+                    f"assembly ID {short_name} does not begin with {', '.join(allowed_assembly_prefix)}"
+                )
+            assembly_id = short_name
 
             logging.debug(f"Processing assembly_id: {assembly_id}")
             if assembly_id:
@@ -111,10 +109,10 @@ def load_record(rec, module_results, cur, assembly_id, record_no):
     if not rec.get_regions():
         return
     genome_id = get_or_create_genome(rec, cur, assembly_id)
-    logging.info("genome_id: %s", genome_id)
+    logging.info("Assigning genome_id: %s", genome_id)
     try:
         seq_id = get_or_create_dna_sequence(rec, cur, genome_id, record_no)
-        logging.info("seq_id: %s", seq_id)
+        logging.info("Assigning seq_id: %s", seq_id)
     except ExistingRecordError:
         print("skipping existing record:", rec.id)
         raise
@@ -1342,8 +1340,25 @@ if __name__ == "__main__":
         default=False,
         help="Ignore check (default: %(default)s)",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="increase output verbosity",
+    )
+
     parser.add_argument("filenames", nargs="*")
     args = parser.parse_args()
+
+    # Set logging level based on the verbose flag
+    if args.verbose:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    log_format = "%(levelname)-8s %(asctime)s   %(message)s"
+    date_format = "%d/%m %H:%M:%S"
+
+    logging.basicConfig(format=log_format, datefmt=date_format, level=level)
 
     TAX_DUMP = (
         json.load(args.taxonomy)
