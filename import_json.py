@@ -111,7 +111,7 @@ def load_record(rec, module_results, cur, assembly_id, record_no):
     if not rec.get_regions():
         return
     genome_id = get_or_create_genome(rec, cur, assembly_id)
-    logging.debug("Assigned genome_id: %s", genome_id)
+    logging.info("Assigned genome_id: %s", genome_id)
     try:
         seq_id = get_or_create_dna_sequence(rec, cur, genome_id, record_no)
         logging.debug("Assigned seq_id: %s", seq_id)
@@ -147,7 +147,13 @@ def get_or_create_dna_sequence(rec, cur, genome_id, record_no):
     params = {}
     params["seq"] = str(rec.seq)
     params["md5sum"] = hashlib.md5(params["seq"].encode("utf-8")).hexdigest()
-    params["accession"] = rec.annotations["accessions"][0]
+    try:
+        params["accession"] = rec.annotations["accessions"][0]
+    except KeyError:
+        logging.warning(
+            f"Unable to find record accessions, using record id: {rec.id} instead..."
+        )
+        params["accession"] = rec.id
     params["version"] = rec.annotations.get("sequence_version", "0")
     params["definition"] = rec.description
     params["genome_id"] = genome_id
