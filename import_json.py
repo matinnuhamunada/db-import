@@ -10,6 +10,7 @@ import traceback
 import urllib
 from argparse import ArgumentParser, FileType
 from collections import defaultdict
+from pathlib import Path
 
 import antismash
 import duckdb
@@ -74,7 +75,7 @@ def main(
                 )
             assembly_id = short_name
 
-            logging.debug(f"Processing assembly_id: {assembly_id}")
+            logging.info(f"Processing assembly_id: {assembly_id}")
             if assembly_id:
                 input_basename = os.path.basename(filename)
                 cursor.execute(
@@ -106,29 +107,36 @@ def main(
 def load_record(rec, module_results, cur, assembly_id, record_no):
     """Load a record into the database using the cursor."""
     logging.debug(f"RUNNING: def load_record {record_no}...")
+    logging.info(f"Processing record: {rec.id}")
     if not rec.get_regions():
         return
     genome_id = get_or_create_genome(rec, cur, assembly_id)
-    logging.info("Assigning genome_id: %s", genome_id)
+    logging.debug("Assigned genome_id: %s", genome_id)
     try:
         seq_id = get_or_create_dna_sequence(rec, cur, genome_id, record_no)
-        logging.info("Assigning seq_id: %s", seq_id)
+        logging.debug("Assigned seq_id: %s", seq_id)
     except ExistingRecordError:
         print("skipping existing record:", rec.id)
         raise
 
     data = RecordData(cur, rec, seq_id, assembly_id, module_results, record_no)
 
-    for region in sorted(rec.get_regions()):
+    logging.info("Processing regions...")
+    for num, region in enumerate(sorted(rec.get_regions())):
         handle_region(data, seq_id, region)
         handle_ripps(data)
+        ctr = num + 1
+    logging.info(f"Finished handling {ctr} regions.")
 
+    logging.info("Processing TTA codons...")
     add_tta_codons(data)
 
+    logging.info("Processing modules....")
     for module in [cluster_compare, pfams, tfbs, tigrfams]:
         module.import_results(data)
 
-    for gene in rec.get_genes():
+    logging.info("Processing genes in each regions...")
+    for num, gene in enumerate(rec.get_genes()):
         handle_gene(data, gene)
 
 
@@ -661,7 +669,7 @@ def get_or_create_monomer(cur, name, substrate_id, modified):
     )
     ret = cur.fetchone()
     desc = ("modified " if modified else "") + ret[0]
-    print("inserting new monomer:", name, " -> ", desc)
+    logging.debug(f"Inserting new monomer: {name} -> {desc}")
     cur.execute(
         "INSERT INTO antismash.monomers (substrate_id, name, description) VALUES (?, ?, ?) RETURNING monomer_id",
         (substrate_id, name.lower(), desc),
@@ -892,56 +900,53 @@ RETURNING module_id"""
             if component.is_modification():
                 function = "modification"
 
-        update_statement = "UPDATE antismash.as_domains SET function_id = ?, module_id = ? WHERE as_domain_id = ?"
-        try:
-            data.cursor.execute(
-                update_statement, (function_ids[function], module_id, domain_id)
-            )
-        except duckdb.duckdb.ConstraintException as e:
-            # Handle Over-Eager Unique Constraint Checking
-            logging.warning(
-                f"Error updating as_domain due to Over-Eager Unique Constraint Checking in DuckDB:\n{e}"
-            )
-            logging.debug("Storing updated row as json for later insertion...")
-            # Step 1: Query the existing row
-            data.cursor.execute(
-                "SELECT * FROM antismash.as_domains WHERE as_domain_id = ?",
-                (domain_id,),
-            )
-            row = data.cursor.fetchone()
-            if row:
-                # Step 2: Convert the row to a dictionary
-                row_dict = dict(
-                    zip([column[0] for column in data.cursor.description], row)
-                )
+        # DuckDB issue with updating table with unique constraint (https://duckdb.org/docs/sql/indexes#over-eager-unique-constraint-checking)
+        # update_statement = "UPDATE antismash.as_domains SET function_id = ?, module_id = ? WHERE as_domain_id = ?"
+        # data.cursor.execute(update_statement, (function_ids[function], module_id, domain_id))
+        logging.debug(
+            f"Storing updated as_domain {domain_id} as json for later insertion..."
+        )
+        # Step 1: Query the existing row
+        data.cursor.execute(
+            "SELECT * FROM antismash.as_domains WHERE as_domain_id = ?",
+            (domain_id,),
+        )
+        row = data.cursor.fetchone()
+        if row:
+            # Step 2: Convert the row to a dictionary
+            row_dict = dict(zip([column[0] for column in data.cursor.description], row))
 
-                # Step 3: Update the dictionary with new values
-                row_dict["function_id"] = function_ids[function]
-                row_dict["module_id"] = module_id
+            # Step 3: Update the dictionary with new values
+            row_dict["function_id"] = function_ids[function]
+            row_dict["module_id"] = module_id
 
-                # Step 4: Append the updated dictionary to a JSON file
-                try:
-                    with open("as_domain_update.json", "r+") as f:
-                        try:
-                            updated_as_domain_row = json.load(f)
-                        except json.JSONDecodeError:
-                            updated_as_domain_row = []
+            # Step 4: Append the updated dictionary to a JSON file
+            outdir = Path("as_domain_update")
+            if not outdir.exists():
+                outdir.mkdir(exist_ok=True, parents=True)
+            outfile = outdir / f"{domain_id}.json"
+            if outfile.exists():
+                with open(outfile, "r+") as f:
+                    try:
+                        updated_as_domain_row = json.load(f)
+                    except json.JSONDecodeError:
+                        updated_as_domain_row = []
 
-                        # Check if row_dict already exists with the same values
-                        exists = any(item == row_dict for item in updated_as_domain_row)
+                    # Check if row_dict already exists with the same values
+                    exists = any(item == row_dict for item in updated_as_domain_row)
 
-                        if not exists:
-                            updated_as_domain_row.append(row_dict)
-                            f.seek(0)
-                            f.truncate()  # Clear the file before writing
-                            json.dump(updated_as_domain_row, f, indent=4)
-                        else:
-                            logging.debug(
-                                "The row already exists in the file with the same values."
-                            )
-                except FileNotFoundError:
-                    with open("as_domain_update.json", "w") as f:
-                        json.dump([row_dict], f, indent=4)
+                    if not exists:
+                        updated_as_domain_row.append(row_dict)
+                        f.seek(0)
+                        f.truncate()  # Clear the file before writing
+                        json.dump(updated_as_domain_row, f, indent=2)
+                    else:
+                        logging.debug(
+                            "The row already exists in the file with the same values."
+                        )
+            else:
+                with open(outfile, "w") as f:
+                    json.dump([row_dict], f, indent=2)
 
     # don't insert the module if the current CDS is not the first CDS of a multi-CDS module,
     # otherwise it'll duplicate
